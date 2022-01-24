@@ -354,7 +354,7 @@ func TestTotal(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			size := Scan(test.v)
+			size := Scan(test.v, nil)
 			if size.Total != test.want {
 				t.Errorf("total=%d, want %d", size.Total, test.want)
 				t.Logf("\n%s", size.Report())

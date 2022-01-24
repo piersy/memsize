@@ -130,7 +130,8 @@ func (h *Handler) scan(root string) (int, bool) {
 	}
 	id := h.reportID
 	start := time.Now()
-	sizes := memsize.Scan(val)
+	path := []string{root}
+	sizes := memsize.Scan(val, path)
 	h.reports[id] = Report{
 		ID:       id,
 		RootName: root,

@@ -12,7 +12,7 @@ import (
 
 // Scan traverses all objects reachable from v and counts how much memory
 // is used per type. The value must be a non-nil pointer to any value.
-func Scan(v interface{}) Sizes {
+func Scan(v interface{}, path []string) Sizes {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
 		panic("value to scan must be non-nil pointer")
@@ -22,7 +22,7 @@ func Scan(v interface{}) Sizes {
 	defer startTheWorld()
 
 	ctx := newContext()
-	ctx.scan(invalidAddr, rv, false)
+	ctx.scan(invalidAddr, rv, false, path)
 	ctx.s.BitmapSize = ctx.seen.size()
 	ctx.s.BitmapUtilization = ctx.seen.utilization()
 	return *ctx.s
@@ -103,7 +103,11 @@ func newContext() *context {
 
 // scan walks all objects below v, determining their size. It returns the size of the
 // previously unscanned parts of the object.
-func (c *context) scan(addr address, v reflect.Value, add bool) (extraSize uintptr) {
+func (c *context) scan(addr address, v reflect.Value, add bool, path []string) (extraSize uintptr) {
+	if v.Type().Name() == "Transaction" {
+		println(v.Type().String())
+		println(strings.Join(path, "->"))
+	}
 	size := v.Type().Size()
 	var marked uintptr
 	if addr.valid() {
@@ -115,7 +119,7 @@ func (c *context) scan(addr address, v reflect.Value, add bool) (extraSize uintp
 	}
 	// fmt.Printf("%v: %v ⮑ (marked %d)\n", addr, v.Type(), marked)
 	if c.tc.needScan(v.Type()) {
-		extraSize = c.scanContent(addr, v)
+		extraSize = c.scanContent(addr, v, path)
 	}
 	size -= marked
 	size += extraSize
@@ -128,37 +132,37 @@ func (c *context) scan(addr address, v reflect.Value, add bool) (extraSize uintp
 
 // scanContent and all other scan* functions below return the amount of 'extra' memory
 // (e.g. slice data) that is referenced by the object.
-func (c *context) scanContent(addr address, v reflect.Value) uintptr {
+func (c *context) scanContent(addr address, v reflect.Value, path []string) uintptr {
 	switch v.Kind() {
 	case reflect.Array:
-		return c.scanArray(addr, v)
+		return c.scanArray(addr, v, path)
 	case reflect.Chan:
-		return c.scanChan(v)
+		return c.scanChan(v, path)
 	case reflect.Func:
 		// can't do anything here
 		return 0
 	case reflect.Interface:
-		return c.scanInterface(v)
+		return c.scanInterface(v, path)
 	case reflect.Map:
-		return c.scanMap(v)
+		return c.scanMap(v, path)
 	case reflect.Ptr:
 		if !v.IsNil() {
-			c.scan(address(v.Pointer()), v.Elem(), true)
+			c.scan(address(v.Pointer()), v.Elem(), true, path)
 		}
 		return 0
 	case reflect.Slice:
-		return c.scanSlice(v)
+		return c.scanSlice(v, path)
 	case reflect.String:
 		return uintptr(v.Len())
 	case reflect.Struct:
-		return c.scanStruct(addr, v)
+		return c.scanStruct(addr, v, path)
 	default:
 		unhandledKind(v.Kind())
 		return 0
 	}
 }
 
-func (c *context) scanChan(v reflect.Value) uintptr {
+func (c *context) scanChan(v reflect.Value, path []string) uintptr {
 	etyp := v.Type().Elem()
 	extra := uintptr(0)
 	if c.tc.needScan(etyp) {
@@ -168,35 +172,37 @@ func (c *context) scanChan(v reflect.Value) uintptr {
 		for i := uint(0); i < uint(v.Cap()); i++ {
 			addr := chanbuf(hchan, i)
 			elem := reflect.NewAt(etyp, addr).Elem()
-			extra += c.scanContent(address(addr), elem)
+			extra += c.scanContent(address(addr), elem, path)
 		}
 	}
 	return uintptr(v.Cap())*etyp.Size() + extra
 }
 
-func (c *context) scanStruct(base address, v reflect.Value) uintptr {
+func (c *context) scanStruct(base address, v reflect.Value, path []string) uintptr {
 	extra := uintptr(0)
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Type().Field(i)
 		if c.tc.needScan(f.Type) {
+			path = append(path, f.Name)
 			addr := base.addOffset(f.Offset)
-			extra += c.scanContent(addr, v.Field(i))
+			extra += c.scanContent(addr, v.Field(i), path)
+			path = path[:len(path)-1]
 		}
 	}
 	return extra
 }
 
-func (c *context) scanArray(addr address, v reflect.Value) uintptr {
+func (c *context) scanArray(addr address, v reflect.Value, path []string) uintptr {
 	esize := v.Type().Elem().Size()
 	extra := uintptr(0)
 	for i := 0; i < v.Len(); i++ {
-		extra += c.scanContent(addr, v.Index(i))
+		extra += c.scanContent(addr, v.Index(i), path)
 		addr = addr.addOffset(esize)
 	}
 	return extra
 }
 
-func (c *context) scanSlice(v reflect.Value) uintptr {
+func (c *context) scanSlice(v reflect.Value, path []string) uintptr {
 	slice := v.Slice(0, v.Cap())
 	esize := slice.Type().Elem().Size()
 	base := slice.Pointer()
@@ -209,14 +215,14 @@ func (c *context) scanSlice(v reflect.Value) uintptr {
 		// Elements may contain pointers, scan them individually.
 		addr := address(base)
 		for i := 0; i < slice.Len(); i++ {
-			extra += c.scanContent(addr, slice.Index(i))
+			extra += c.scanContent(addr, slice.Index(i), path)
 			addr = addr.addOffset(esize)
 		}
 	}
 	return extra
 }
 
-func (c *context) scanMap(v reflect.Value) uintptr {
+func (c *context) scanMap(v reflect.Value, path []string) uintptr {
 	var (
 		typ   = v.Type()
 		len   = uintptr(v.Len())
@@ -224,8 +230,8 @@ func (c *context) scanMap(v reflect.Value) uintptr {
 	)
 	if c.tc.needScan(typ.Key()) || c.tc.needScan(typ.Elem()) {
 		iterateMap(v, func(k, v reflect.Value) {
-			extra += c.scan(invalidAddr, k, false)
-			extra += c.scan(invalidAddr, v, false)
+			extra += c.scan(invalidAddr, k, false, path)
+			extra += c.scan(invalidAddr, v, false, path)
 		})
 	} else {
 		extra = len*typ.Key().Size() + len*typ.Elem().Size()
@@ -233,12 +239,12 @@ func (c *context) scanMap(v reflect.Value) uintptr {
 	return extra
 }
 
-func (c *context) scanInterface(v reflect.Value) uintptr {
+func (c *context) scanInterface(v reflect.Value, path []string) uintptr {
 	elem := v.Elem()
 	if !elem.IsValid() {
 		return 0 // nil interface
 	}
-	extra := c.scan(invalidAddr, elem, false)
+	extra := c.scan(invalidAddr, elem, false, path)
 	if elem.Type().Kind() == reflect.Ptr {
 		extra -= uintptrBytes
 	}
